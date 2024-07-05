@@ -17,6 +17,7 @@
 #define FLASHINFER_DECODE_CUH_
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
+#include <stdio.h>
 #include <cuda_fp16.h>
 
 #include <cstddef>
@@ -49,6 +50,48 @@ using cp_async::SharedMemFillMode;
 
 namespace {
 
+template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode, uint32_t vec_size,
+          uint32_t bdx, uint32_t tile_size, typename T>
+__device__ __forceinline__ void compute_qk_opt(const T* smem, uint32_t compute_stage_idx,
+                                           const vec_t<float, vec_size>& q_vec,
+                                           const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
+                                           uint32_t iter_base, uint32_t iter_bound,
+                                           const int32_t q_offset, float alibi_slope, float* s,
+                                           state_t<vec_size>& st, const float logits_soft_cap) {
+  uint32_t tx = threadIdx.x, tz = threadIdx.z;
+  float m_prev = st.m;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_size; ++j) {
+    vec_t<float, vec_size> k_vec;
+    // do not apply rotary embedding
+    k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
+    s[j] = 0.f;
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      s[j] += q_vec[i] * k_vec[i];
+    }
+#pragma unroll
+    for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
+      s[j] += math::shfl_xor_sync(s[j], offset);
+    }
+    s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -5e4;
+    s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
+    st.m = max(st.m, s[j]);
+  }
+
+  float o_scale = math::ptx_exp2(m_prev - st.m);
+  st.d *= o_scale;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_size; ++j) {
+    s[j] = math::ptx_exp2(s[j] - st.m);
+    st.d += s[j];
+  }
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    st.o[i] = st.o[i] * o_scale;
+  }
+}
+
 /*!
  * \brief Load k tile from smem and compute qk
  * \tparam logits_post_hook The logits post hook used in the kernel
@@ -69,6 +112,7 @@ namespace {
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
+
 template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode, uint32_t vec_size,
           uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
@@ -181,6 +225,145 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
 
 }  // namespace
 
+
+template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_kv,
+          PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ,
+          typename DTypeKV, typename DTypeOut>
+__global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
+                                              DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
+                                              float* __restrict__ lse,
+                                              tensor_info_t<kv_layout, bdx * vec_size> info,
+                                              float logits_soft_cap, float sm_scale,
+                                              float rope_rcp_scale, float rope_rcp_theta,
+                                              uint32_t kv_chunk_size) {
+  auto block = cg::this_thread_block();
+  auto grid = cg::this_grid();
+  sm_scale *= math::log2e;
+
+  constexpr uint32_t head_dim = bdx * vec_size;
+  uint32_t kv_head_idx = blockIdx.y;
+  uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
+  uint32_t kv_chunk_idx = blockIdx.x;
+  uint32_t num_qo_heads = info.num_qo_heads;
+  const float alibi_slope = 0.f;
+  uint32_t seq_len = info.kv_len;
+
+  extern __shared__ uint8_t smem[];
+  DTypeKV* k_smem = (DTypeKV*)smem;
+  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim * sizeof(DTypeKV));
+
+  float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy + tile_size_per_bdx * bdz * head_dim * sizeof(DTypeKV));
+
+  uint32_t tx = threadIdx.x;
+  uint32_t ty = threadIdx.y;
+  uint32_t tz = threadIdx.z;
+
+  vec_t<float, vec_size> q_vec;
+  vec_t<float, vec_size> freq;
+  // do not apply rotary embedding to q matrix
+  q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
+  // multiple q_vec by sm_scale
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    q_vec[i] *= sm_scale;
+  }
+  block.sync();
+
+  uint32_t chunk_start = kv_chunk_idx * kv_chunk_size;
+  kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
+  uint32_t chunk_end = chunk_start + kv_chunk_size;
+  
+  // preload k tiles and v tiles
+  uint32_t producer_kv_idx_base = chunk_start;
+  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
+
+#pragma unroll
+  for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
+    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          k_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+              tx * vec_size,
+          k + info.get_kv_elem_offset(
+                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
+                  tx * vec_size),
+          producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+          v_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+              tx * vec_size,
+          v + info.get_kv_elem_offset(
+                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
+                  tx * vec_size),
+          producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
+    }
+    cp_async::commit_group();
+    producer_kv_idx_base += bdy * bdz * tile_size_per_bdx;
+  }
+
+  // pipelining k/v tiles loading and state updating
+  uint32_t consumer_kv_idx_base = chunk_start, stage_idx = 0;
+  state_t<vec_size> st_local;
+  float s[bdy * tile_size_per_bdx];
+
+#pragma unroll 2
+  for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
+    // compute qk
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    compute_qk_opt<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
+        freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size,
+        seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
+    block.sync();
+    // load k
+    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+              tx * vec_size,
+          k + info.get_kv_elem_offset(
+                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
+                  tx * vec_size),
+          producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
+    }
+    cp_async::commit_group();
+
+    // update m/d/o state
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx,
+        st_local);
+    block.sync();
+
+    // load v
+    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+          v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+              tx * vec_size,
+          v + info.get_kv_elem_offset(
+                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
+                  tx * vec_size),
+          producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
+    }
+    cp_async::commit_group();
+
+    stage_idx = (stage_idx + 1) % num_stages_smem;
+    producer_kv_idx_base += tile_size_per_bdx * bdy * bdz;
+    consumer_kv_idx_base += tile_size_per_bdx * bdy * bdz;
+  }
+  cp_async::wait_group<0>();
+  block.sync();
+
+  // sync local state of all warps inside a threadblock
+  sync_state<vec_size, bdx, bdy, bdz>(st_local, reinterpret_cast<float*>(smem), smem_md);
+  st_local.normalize();
+
+  st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+  if (lse != nullptr) {
+    lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
+  }
+}
+
 /*!
  * \brief FlashAttention decoding cuda kernel with kv-cache for a single request
  * \tparam logits_post_hook The logits post hook used in the kernel
@@ -207,6 +390,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
+
 template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_kv,
           PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ,
@@ -653,7 +837,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
     if (seq_len <= 256 || tmp == nullptr) {
       // no need to use partition-kv kernel
       auto kernel =
-          SingleDecodeWithKVCacheKernel<LOGITS_POST_HOOK, KV_LAYOUT, /*partition_kv=*/false,
+          SingleDecodeWithKVCacheKernelOpt<LOGITS_POST_HOOK, KV_LAYOUT, /*partition_kv=*/false,
                                         POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
                                         vec_size, bdx, bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
       FLASHINFER_CUDA_CALL(
