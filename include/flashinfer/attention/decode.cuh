@@ -314,19 +314,8 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size,
         seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
     block.sync();
-    // load k
-    for (int32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
-              tx * vec_size,
-          k + info.get_kv_elem_offset(
-                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
-                  tx * vec_size),
-          producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
-    }
-    cp_async::commit_group();
 
-    // update m/d/o state
+    // compute v
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
@@ -336,6 +325,13 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
 
     // load v
     for (int32_t j = 0; j < tile_size_per_bdx; ++j) {
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+              tx * vec_size,
+          k + info.get_kv_elem_offset(
+                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
+                  tx * vec_size),
+          producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -358,9 +354,6 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
   st_local.normalize();
 
   st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
-  if (lse != nullptr) {
-    lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
-  }
 }
 
 /*!
