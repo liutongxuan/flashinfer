@@ -171,7 +171,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut*
                                     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
                                     std::optional<float> maybe_sm_scale = std::nullopt,
                                     float rope_scale = 1.f, float rope_theta = 1e4,
-                                    cudaStream_t stream = nullptr) {
+                                    cudaStream_t stream = nullptr, bool opt = false) {
   float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -187,7 +187,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut*
             SingleDecodeWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT,
                                               POS_ENCODING_MODE>(
                 q, k, v, o, tmp, num_qo_heads, num_kv_heads, seq_len, /*logits_soft_cap=*/0.f,
-                sm_scale, rope_scale, rope_theta, stream);
+                sm_scale, rope_scale, rope_theta, stream, opt);
           })})});
   return cudaSuccess;
 }

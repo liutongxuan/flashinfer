@@ -31,6 +31,7 @@ void bench_flashinfer_single_decode(nvbench::state& state) {
   size_t pos_encoding_mode = state.get_int64("pos_encoding_mode");
   size_t kv_layout = state.get_int64("kv_layout");
   bool cooperative = state.get_int64("cooperative");
+  bool opt = state.get_int64("opt");
   // Allocate input data:
   thrust::device_vector<dtype_qo> Q(num_qo_heads * head_dim);
   thrust::device_vector<dtype_kv> K(seq_len * num_kv_heads * head_dim);
@@ -52,7 +53,7 @@ void bench_flashinfer_single_decode(nvbench::state& state) {
         seq_len, head_dim, QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode),
         /*maybe_sm_scale=*/std::nullopt,
         /*rope_scale=*/1.f,
-        /*rope_theta=*/1e4, launch.get_stream());
+        /*rope_theta=*/1e4, launch.get_stream(), opt);
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -112,13 +113,14 @@ void bench_flashinfer_single_decode_with_prefill(nvbench::state& state) {
   NVBENCH_BENCH(bench_flashinfer_single_decode_##dtype_qo##_##dtype_kv##_)                  \
       .set_name(("bench_flashinfer_single_decode_" STR(dtype_qo) "_" STR(dtype_kv)))        \
       .add_int64_axis("seq_len",                                                            \
-                      {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536}) \
+                      {32, 64, 128, 256}) \
       .add_int64_axis("num_qo_heads", {32})                                                 \
-      .add_int64_axis("num_kv_heads", {32, 4})                                              \
+      .add_int64_axis("num_kv_heads", {32})                                              \
       .add_int64_axis("head_dim", {128})                                                    \
-      .add_int64_axis("pos_encoding_mode", {0, 1})                                          \
-      .add_int64_axis("kv_layout", {0, 1})                                                  \
-      .add_int64_axis("cooperative", {1})
+      .add_int64_axis("pos_encoding_mode", {0})                                          \
+      .add_int64_axis("kv_layout", {0})                                                  \
+      .add_int64_axis("cooperative", {1})                                                  \
+      .add_int64_axis("opt", {0,1})
 
 #define BENCH_FLASHINFER_SINGLE_DECODE_WITH_PREFILL(dtype_in, dtype_out)                           \
   auto bench_flashinfer_single_decode_with_prefill_##dtype_in##_##dtype_out##_ =                   \
@@ -135,7 +137,7 @@ void bench_flashinfer_single_decode_with_prefill(nvbench::state& state) {
       .add_int64_axis("cooperative", {1})
 
 BENCH_FLASHINFER_SINGLE_DECODE(half, half);
-BENCH_FLASHINFER_SINGLE_DECODE(half, __nv_fp8_e5m2);
+// BENCH_FLASHINFER_SINGLE_DECODE(half, __nv_fp8_e5m2);
 // Use prefill kernel for decoding, useful in GQA on GPUs with low non-tensor performance such as
 // A100
-BENCH_FLASHINFER_SINGLE_DECODE_WITH_PREFILL(half, half);
+//BENCH_FLASHINFER_SINGLE_DECODE_WITH_PREFILL(half, half);

@@ -67,7 +67,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                       static_cast<qkv_type*>(q.data_ptr()), static_cast<qkv_type*>(k.data_ptr()),
                       static_cast<qkv_type*>(v.data_ptr()), static_cast<qkv_type*>(o.data_ptr()),
                       static_cast<qkv_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len,
-                      logits_soft_cap, sm_scale, rope_scale, rope_theta, torch_current_stream);
+                      logits_soft_cap, sm_scale, rope_scale, rope_theta, torch_current_stream, false);
                   TORCH_CHECK(status == cudaSuccess,
                               "SingleDecodeWithKVCache kernel launch failed, error: " +
                                   std::string(cudaGetErrorString(status)));
@@ -92,7 +92,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                             static_cast<kv_type*>(v.data_ptr()), static_cast<q_type*>(o.data_ptr()),
                             static_cast<q_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads,
                             kv_len, logits_soft_cap, sm_scale, rope_scale, rope_theta,
-                            torch_current_stream);
+                            torch_current_stream, false);
                     TORCH_CHECK(status == cudaSuccess,
                                 "SingleDecodeWithKVCache kernel launch failed, error: " +
                                     std::string(cudaGetErrorString(status)));

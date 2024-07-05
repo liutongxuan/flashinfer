@@ -34,7 +34,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
                                               uint32_t num_kv_heads, uint32_t seq_len,
                                               float logits_soft_cap, float sm_scale,
                                               float rope_scale, float rope_theta,
-                                              cudaStream_t stream);
+                                              cudaStream_t stream, bool opt);
 
 template <uint32_t HEAD_DIM, PageStorage page_storage, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
