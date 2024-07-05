@@ -225,7 +225,6 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
 
 }  // namespace
 
-
 template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_kv,
           PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ,
@@ -265,7 +264,7 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
   q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
   // multiple q_vec by sm_scale
 #pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
+  for (int32_t i = 0; i < vec_size; ++i) {
     q_vec[i] *= sm_scale;
   }
   block.sync();
@@ -279,8 +278,8 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
   constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
 
 #pragma unroll
-  for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
-    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+  for (int32_t iter = 0; iter < num_stages_smem; ++iter) {
+    for (int32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -306,7 +305,7 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
   float s[bdy * tile_size_per_bdx];
 
 #pragma unroll 2
-  for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
+  for (int32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -316,7 +315,7 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
         seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
     block.sync();
     // load k
-    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+    for (int32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -336,7 +335,7 @@ __global__ void SingleDecodeWithKVCacheKernelOpt(DTypeQ* __restrict__ q, DTypeKV
     block.sync();
 
     // load v
-    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+    for (int32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
