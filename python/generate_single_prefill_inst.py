@@ -45,7 +45,7 @@ template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {logits_hook
     {dtype_in}* q, {dtype_in}* k, {dtype_in}* v, uint8_t* custom_mask, {dtype_out}* o,
     {dtype_out}* tmp, float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     float logits_soft_cap, float sm_scale, float rope_scale,
-    float rope_theta, cudaStream_t stream);
+    float rope_theta, cudaStream_t stream, bool opt);
 
 }}
     """.format(

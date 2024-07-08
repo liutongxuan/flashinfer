@@ -35,7 +35,7 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
 cudaError_t SinglePrefillWithKVCacheDispatched(
     DTypeIn* q, DTypeIn* k, DTypeIn* v, uint8_t* custom_mask, DTypeOut* o, DTypeOut* tmp,
     float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
-    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream, bool opt);
 
 template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,

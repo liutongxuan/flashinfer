@@ -1747,7 +1747,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                                                uint32_t num_kv_heads, uint32_t qo_len,
                                                uint32_t kv_len, float logits_soft_cap,
                                                float sm_scale, float rope_scale, float rope_theta,
-                                               cudaStream_t stream) {
+                                               cudaStream_t stream, bool opt) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   if (kv_len < qo_len && MASK_MODE == MaskMode::kCausal) {

@@ -30,7 +30,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
     uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
-    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr, bool opt = false) {
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
   DISPATCH_allow_fp16_qk_reduction(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
@@ -42,7 +42,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
                     HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, POS_ENCODING_MODE,
                     ALLOW_FP16_QK_REDUCTION, MaskMode::kCustom>(
                     q, k, v, custom_mask, o, tmp, lse, num_qo_heads, num_kv_heads, qo_len, kv_len,
-                    /*logits_soft_cap*/ 0.f, sm_scale, rope_scale, rope_theta, stream);
+                    /*logits_soft_cap*/ 0.f, sm_scale, rope_scale, rope_theta, stream, opt);
               })})})});
   return cudaSuccess;
 }
@@ -80,7 +80,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                      bool allow_fp16_qk_reduction = false,
                                      std::optional<float> maybe_sm_scale = std::nullopt,
                                      float rope_scale = 1.f, float rope_theta = 1e4,
-                                     cudaStream_t stream = nullptr) {
+                                     cudaStream_t stream = nullptr, bool opt = false) {
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
   DISPATCH_allow_fp16_qk_reduction(
@@ -96,7 +96,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                                               ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
                         q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads, num_kv_heads,
                         qo_len, kv_len, /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta,
-                        stream);
+                        stream, opt);
                   })})})})});
   return cudaSuccess;
 }

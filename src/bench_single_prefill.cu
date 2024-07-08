@@ -43,6 +43,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
   bool cooperative = state.get_int64("cooperative");
   bool custom_mask = state.get_int64("custom_mask");
   bool allow_fp16_qk_reduction = state.get_int64("allow_fp16_qk_reduction");
+  bool opt = state.get_int64("opt");
   // Allocate input data:
   thrust::device_vector<dtype_in> Q(qo_len * num_qo_heads * head_dim);
   thrust::device_vector<dtype_in> K(kv_len * num_kv_heads * head_dim);
@@ -69,7 +70,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
           QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction,
           /*maybe_sm_scale=*/std::nullopt,
           /*rope_scale=*/1.f,
-          /*rope_theta=*/1e4, launch.get_stream());
+          /*rope_theta=*/1e4, launch.get_stream(), opt);
     } else {
       status = flashinfer::SinglePrefillWithKVCache<dtype_in, dtype_out>(
           thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
@@ -79,7 +80,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
           QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction,
           /*maybe_sm_scale=*/std::nullopt,
           /*rope_scale=*/1.f,
-          /*rope_theta=*/1e4, launch.get_stream());
+          /*rope_theta=*/1e4, launch.get_stream(), opt);
     }
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
@@ -118,7 +119,8 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
       .add_int64_axis("pos_encoding_mode", {0, 1})                                          \
       .add_int64_axis("allow_fp16_qk_reduction", {0, 1})                                    \
       .add_int64_axis("custom_mask", {0})                                                   \
-      .add_int64_axis("cooperative", {1})
+      .add_int64_axis("cooperative", {1})                                                   \
+      .add_int64_axis("opt", {0,1})
 
 #define BENCH_FLASHINFER_APPEND_PREFILL(dtype_in, dtype_out)                                  \
   auto bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_ =                   \
@@ -138,4 +140,4 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
       .add_int64_axis("cooperative", {0, 1})
 
 BENCH_FLASHINFER_PREFILL(half, half);
-BENCH_FLASHINFER_APPEND_PREFILL(half, half);
+//BENCH_FLASHINFER_APPEND_PREFILL(half, half);

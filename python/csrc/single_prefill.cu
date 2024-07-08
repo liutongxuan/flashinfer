@@ -79,7 +79,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                                 static_cast<c_type*>(tmp.data_ptr()),
                                 /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                                 num_qo_heads, num_kv_heads, qo_len, kv_len, logits_soft_cap,
-                                sm_scale, rope_scale, rope_theta, torch_current_stream);
+                                sm_scale, rope_scale, rope_theta, torch_current_stream, false);
                         TORCH_CHECK(status == cudaSuccess,
                                     "SinglePrefillWithKVCache kernel launch failed, error: " +
                                         std::string(cudaGetErrorString(status)));
@@ -159,7 +159,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
                           static_cast<c_type*>(o.data_ptr()), static_cast<c_type*>(tmp.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                           num_qo_heads, num_kv_heads, qo_len, kv_len, logits_soft_cap, sm_scale,
-                          rope_scale, rope_theta, torch_current_stream);
+                          rope_scale, rope_theta, torch_current_stream, false);
                       TORCH_CHECK(status == cudaSuccess,
                                   "SinglePrefillWithKVCache kernel launch failed, error: " +
                                       std::string(cudaGetErrorString(status)));
