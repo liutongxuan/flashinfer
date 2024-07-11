@@ -843,6 +843,12 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
 
         dim3 nblks = dim3(1, num_kv_heads);
         dim3 nthrs = dim3(bdx, bdy, bdz);
+
+        // recommended block size and grid size
+        // int grid_size = 0;
+        // int block_size = 0;
+        // cudaOccupancyMaxPotentialBlockSize(&grid_size, &block_size, kernel, 0, 0);
+
         float* lse = nullptr;
         void* args[] = {(void*)&q,
                         (void*)&k,
