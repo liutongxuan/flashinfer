@@ -110,14 +110,14 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
   NVBENCH_BENCH(bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_)                \
       .set_name(("bench_flashinfer_single_prefill_" STR(dtype_in) "_" STR(dtype_out)))      \
       .add_int64_axis("kv_len",                                                             \
-                      {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536}) \
+                      {32, 64, 128, 256, 512, 1024, 2048})                                  \
       .add_int64_axis("num_qo_heads", {32})                                                 \
       .add_int64_axis("num_kv_heads", {32})                                                 \
       .add_int64_axis("head_dim", {128})                                                    \
-      .add_int64_axis("causal", {0, 1})                                                     \
-      .add_int64_axis("kv_layout", {0, 1})                                                  \
-      .add_int64_axis("pos_encoding_mode", {0, 1})                                          \
-      .add_int64_axis("allow_fp16_qk_reduction", {0, 1})                                    \
+      .add_int64_axis("causal", {0})                                                        \
+      .add_int64_axis("kv_layout", {0})                                                     \
+      .add_int64_axis("pos_encoding_mode", {0})                                             \
+      .add_int64_axis("allow_fp16_qk_reduction", {0})                                       \
       .add_int64_axis("custom_mask", {0})                                                   \
       .add_int64_axis("cooperative", {1})                                                   \
       .add_int64_axis("opt", {0,1})

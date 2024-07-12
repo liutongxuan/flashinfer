@@ -939,6 +939,155 @@ __device__ __forceinline__ void write_o_reg_gmem(
 
 }  // namespace
 
+template <LogitsPostHook logits_post_hook, bool partition_kv, MaskMode mask_mode,
+          QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
+          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut>
+__global__ void SinglePrefillWithKVCacheKernelOpt(
+    DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
+    uint8_t* __restrict__ custom_mask, DTypeOut* __restrict__ o, float* __restrict__ lse,
+    const uint32_t qo_len, const uint32_t kv_len, const uint_fastdiv group_size,
+    const float logits_soft_cap, float sm_scale, const float log2_rope_rcp_scale,
+    const float log2_rope_rcp_theta) {
+  static_assert(sizeof(DTypeIn) == 2);
+  static_assert(sizeof(DTypeOut) == 2);
+  sm_scale *= math::log2e;
+  const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<num_warps_x, num_warps_z>();
+  const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
+  const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+  constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
+  const tensor_info_t<kv_layout, num_frags_y * 16> qkv_info(qo_len, kv_len, num_qo_heads,
+                                                            num_kv_heads);
+  float alibi_slopes[num_frags_x][2];
+
+  const uint32_t num_chunks = gridDim.y;
+  const uint32_t chunk_size = kv_len;
+  const uint32_t chunk_start = 0;
+  const uint32_t chunk_end = kv_len;
+  auto block = cg::this_thread_block();
+
+  constexpr uint32_t head_dim = num_frags_y * 16;
+  constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
+  constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
+
+  extern __shared__ uint8_t smem[];
+
+  DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
+  float o_frag[num_frags_x][num_frags_y][8];
+  DTypeQKAccum m[num_frags_x][2];
+  float d[num_frags_x][2];
+  float rope_freq[num_frags_y / 2][4];
+  init_states<num_frags_x, num_frags_y>(o_frag, m, d);
+
+  // cooperative fetch q fragment from gmem to reg
+  const uint32_t qo_packed_idx_base =
+      (bx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
+  const uint32_t kv_n_stride = qkv_info.get_kv_n_stride(), qo_n_stride = qkv_info.get_qo_n_stride(),
+                 qo_h_stride = qkv_info.get_qo_h_stride();
+  smem_t qo_smem(smem);
+  DTypeIn* q_ptr_base =
+      q + qkv_info.get_qo_elem_offset(0, kv_head_idx * group_size,
+                                      (lane_idx % 8) * num_elems_per_128b<DTypeIn>());
+  DTypeOut* o_ptr_base =
+          o + qkv_info.get_qo_elem_offset(0, kv_head_idx * group_size,
+                                          (lane_idx % 8) * num_elems_per_128b<DTypeOut>());
+  uint32_t q_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_in>(
+      get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16 + lane_idx % 16, lane_idx / 16);
+
+  load_q_global_smem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
+      qo_packed_idx_base, qo_len, q_ptr_base, qo_n_stride, qo_h_stride, group_size, &qo_smem);
+
+  cp_async::commit_group();
+  cp_async::wait_group<0>();
+  block.sync();
+
+  q_smem_inplace_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x, num_frags_y, DTypeIn>(
+      &qo_smem, sm_scale);
+
+  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeIn)),
+      v_smem(smem + (num_warps_x * num_frags_x + num_warps_z * num_frags_z) * 16 * head_dim *
+                        sizeof(DTypeIn));
+
+  const uint32_t num_iterations = ceil_div(chunk_end - chunk_start, 16 * num_warps_z * num_frags_z);
+
+  const uint32_t mask_iteration = (chunk_end - chunk_start) / (16 * num_warps_z * num_frags_z);
+
+  DTypeIn* k_ptr =
+      k + qkv_info.get_kv_elem_offset(chunk_start + warp_idx * 4 + lane_idx / 8, kv_head_idx,
+                                      (lane_idx % 8) * num_elems_per_128b<DTypeIn>());
+  DTypeIn* v_ptr =
+      v + qkv_info.get_kv_elem_offset(chunk_start + warp_idx * 4 + lane_idx / 8, kv_head_idx,
+                                      (lane_idx % 8) * num_elems_per_128b<DTypeIn>());
+  uint32_t k_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_in>(
+               get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 8 * (lane_idx / 16) +
+                   lane_idx % 8,
+               (lane_idx % 16) / 8),
+           v_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_in>(
+               get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + lane_idx % 16,
+               lane_idx / 16),
+           kv_smem_offset_w = smem_t::get_permuted_offset<channel_size_128b_in>(
+               warp_idx * 4 + lane_idx / 8, lane_idx % 8);
+  produce_kv<SharedMemFillMode::kNoFill, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
+      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, chunk_start, chunk_end);
+  cp_async::commit_group();
+  produce_kv<SharedMemFillMode::kFillZero, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
+      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, chunk_start, chunk_end);
+  cp_async::commit_group();
+
+#pragma unroll 1
+  for (uint32_t iter = 0; iter < num_iterations; ++iter) {
+    cp_async::wait_group<1>();
+    block.sync();
+
+    // compute attention score
+    compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
+        &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, logits_soft_cap);
+
+    if (iter >= mask_iteration) {
+      mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
+          qo_packed_idx_base,
+          chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
+                            num_frags_z * 16,
+          qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
+    }
+
+    // compute m,d states in online softmax
+    update_mdo_states<num_frags_x, num_frags_y, num_frags_z>(s_frag, o_frag, m, d);
+
+    block.sync();
+    produce_kv<SharedMemFillMode::kNoFill, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
+        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride,
+        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, chunk_end);
+    cp_async::commit_group();
+    cp_async::wait_group<1>();
+    block.sync();
+
+    // compute sfm*v
+    compute_sfm_v<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&v_smem, &v_smem_offset_r, s_frag,
+                                                                  o_frag, d);
+
+    block.sync();
+    produce_kv<SharedMemFillMode::kFillZero, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
+        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride,
+        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, chunk_end);
+    cp_async::commit_group();
+  }
+  cp_async::wait_group<0>();
+  block.sync();
+
+  // threadblock synchronization
+  threadblock_sync_mdo_states<num_warps_x, num_warps_z, num_frags_x, num_frags_y, DTypeQKAccum>(
+      o_frag, (float*)smem, m, d, warp_idx, lane_idx);
+
+  // normalize d
+  normalize_d<num_frags_x, num_frags_y>(o_frag, d);
+
+  // write back
+  write_o_reg_gmem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
+      o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
+      partition_kv ? qo_n_stride * num_chunks : qo_n_stride, qo_h_stride, group_size);
+}
+
 /*!
  * \brief FlashAttention prefill CUDA kernel for a single request.
  * \tparam partition_kv Whether to split kv_len into chunks.
@@ -1806,82 +1955,162 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                    " and report the issue to the developers.";
         throw std::invalid_argument(err_msg.str());
       } else {
-        constexpr uint32_t num_threads = (num_warps_x * num_warps_z) * warp_size;
-        constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
-        auto partition_kv_kernel =
-            SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/true, MASK_MODE,
-                                           KV_LAYOUT, pos_encoding_mode, num_frags_x, num_frags_y,
-                                           num_frags_z, num_warps_x, num_warps_z, DTypeIn,
-                                           DTypeQKAccum, DTypeOut>;
-        uint32_t smem_size = (num_frags_x * num_warps_x + num_frags_z * num_warps_z * 2) * 16 *
-                             HEAD_DIM * sizeof(DTypeIn);
-        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-            partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        int num_blocks_per_sm = 0;
-        int num_sm = 0;
-        FLASHINFER_CUDA_CALL(
-            cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
-        uint32_t max_num_kv_chunks =
-            (num_blocks_per_sm * num_sm) /
-            (num_kv_heads * ceil_div(qo_len * group_size, num_rows_per_cta));
-        uint32_t num_chunks;
-        if (max_num_kv_chunks > 0) {
-          uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
-          num_chunks = ceil_div(kv_len, chunk_size);
-        } else {
-          num_chunks = 0;
-        }
-
-        if (num_chunks <= 1 || tmp == nullptr) {
-          // Enough parallelism, do not split-kv
-          auto kernel =
-              SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/false, MASK_MODE,
+        if (opt) {
+          constexpr uint32_t num_threads = (num_warps_x * num_warps_z) * warp_size;
+          constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
+          auto partition_kv_kernel =
+              SinglePrefillWithKVCacheKernelOpt<LOGITS_POST_HOOK, /*partition_kv=*/true, MASK_MODE,
                                              KV_LAYOUT, pos_encoding_mode, num_frags_x, num_frags_y,
                                              num_frags_z, num_warps_x, num_warps_z, DTypeIn,
                                              DTypeQKAccum, DTypeOut>;
-          void* args[] = {(void*)&q,
-                          (void*)&k,
-                          (void*)&v,
-                          (void*)&custom_mask,
-                          (void*)&o,
-                          (void*)&lse,
-                          (void*)&qo_len,
-                          (void*)&kv_len,
-                          (void*)&group_size_fastdiv,
-                          (void*)&logits_soft_cap,
-                          (void*)&sm_scale,
-                          (void*)&log2_rope_rcp_scale,
-                          (void*)&log2_rope_rcp_theta};
-          dim3 nblks(ceil_div(qo_len * group_size, num_rows_per_cta), 1, num_kv_heads);
-          dim3 nthrs(32, num_warps_x, num_warps_z);
+          uint32_t smem_size = (num_frags_x * num_warps_x + num_frags_z * num_warps_z * 2) * 16 *
+                               HEAD_DIM * sizeof(DTypeIn);
+          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+              partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          int num_blocks_per_sm = 0;
+          int num_sm = 0;
           FLASHINFER_CUDA_CALL(
-              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+              cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+          FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
+          uint32_t max_num_kv_chunks =
+              (num_blocks_per_sm * num_sm) /
+              (num_kv_heads * ceil_div(qo_len * group_size, num_rows_per_cta));
+          uint32_t num_chunks;
+          if (max_num_kv_chunks > 0) {
+            uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
+            num_chunks = ceil_div(kv_len, chunk_size);
+          } else {
+            num_chunks = 0;
+          }
+
+          if (num_chunks <= 1 || tmp == nullptr) {
+            // Enough parallelism, do not split-kv
+            auto kernel =
+                SinglePrefillWithKVCacheKernelOpt<LOGITS_POST_HOOK, /*partition_kv=*/false, MASK_MODE,
+                                                  KV_LAYOUT, pos_encoding_mode, num_frags_x, num_frags_y,
+                                                  num_frags_z, num_warps_x, num_warps_z, DTypeIn,
+                                                  DTypeQKAccum, DTypeOut>;
+            void* args[] = {(void*)&q,
+                            (void*)&k,
+                            (void*)&v,
+                            (void*)&custom_mask,
+                            (void*)&o,
+                            (void*)&lse,
+                            (void*)&qo_len,
+                            (void*)&kv_len,
+                            (void*)&group_size_fastdiv,
+                            (void*)&logits_soft_cap,
+                            (void*)&sm_scale,
+                            (void*)&log2_rope_rcp_scale,
+                            (void*)&log2_rope_rcp_theta};
+            dim3 nblks(ceil_div(qo_len * group_size, num_rows_per_cta), 1, num_kv_heads);
+            dim3 nthrs(32, num_warps_x, num_warps_z);
+            FLASHINFER_CUDA_CALL(
+                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            FLASHINFER_CUDA_CALL(
+                cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+          } else {
+            // Use cooperative groups to increase occupancy
+            float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM);
+            void* args[] = {(void*)&q,
+                            (void*)&k,
+                            (void*)&v,
+                            (void*)&custom_mask,
+                            (void*)&tmp,
+                            (void*)&tmp_lse,
+                            (void*)&qo_len,
+                            (void*)&kv_len,
+                            (void*)&group_size_fastdiv,
+                            (void*)&logits_soft_cap,
+                            (void*)&sm_scale,
+                            (void*)&log2_rope_rcp_scale,
+                            (void*)&log2_rope_rcp_theta};
+            dim3 nblks(ceil_div(qo_len * group_size, num_rows_per_cta), num_chunks, num_kv_heads);
+            dim3 nthrs(32, num_warps_x, num_warps_z);
+            FLASHINFER_CUDA_CALL(
+                cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
+            FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
+                                             HEAD_DIM, stream));
+          }
         } else {
-          // Use cooperative groups to increase occupancy
-          float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM);
-          void* args[] = {(void*)&q,
-                          (void*)&k,
-                          (void*)&v,
-                          (void*)&custom_mask,
-                          (void*)&tmp,
-                          (void*)&tmp_lse,
-                          (void*)&qo_len,
-                          (void*)&kv_len,
-                          (void*)&group_size_fastdiv,
-                          (void*)&logits_soft_cap,
-                          (void*)&sm_scale,
-                          (void*)&log2_rope_rcp_scale,
-                          (void*)&log2_rope_rcp_theta};
-          dim3 nblks(ceil_div(qo_len * group_size, num_rows_per_cta), num_chunks, num_kv_heads);
-          dim3 nthrs(32, num_warps_x, num_warps_z);
+          constexpr uint32_t num_threads = (num_warps_x * num_warps_z) * warp_size;
+          constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
+          auto partition_kv_kernel =
+              SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/true, MASK_MODE,
+                                             KV_LAYOUT, pos_encoding_mode, num_frags_x, num_frags_y,
+                                             num_frags_z, num_warps_x, num_warps_z, DTypeIn,
+                                             DTypeQKAccum, DTypeOut>;
+          uint32_t smem_size = (num_frags_x * num_warps_x + num_frags_z * num_warps_z * 2) * 16 *
+                               HEAD_DIM * sizeof(DTypeIn);
+          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+              partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          int num_blocks_per_sm = 0;
+          int num_sm = 0;
           FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
-          FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
-                                           HEAD_DIM, stream));
+              cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+          FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
+          uint32_t max_num_kv_chunks =
+              (num_blocks_per_sm * num_sm) /
+              (num_kv_heads * ceil_div(qo_len * group_size, num_rows_per_cta));
+          uint32_t num_chunks;
+          if (max_num_kv_chunks > 0) {
+            uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
+            num_chunks = ceil_div(kv_len, chunk_size);
+          } else {
+            num_chunks = 0;
+          }
+
+          if (num_chunks <= 1 || tmp == nullptr) {
+            // Enough parallelism, do not split-kv
+            auto kernel =
+                SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/false, MASK_MODE,
+                                               KV_LAYOUT, pos_encoding_mode, num_frags_x, num_frags_y,
+                                               num_frags_z, num_warps_x, num_warps_z, DTypeIn,
+                                               DTypeQKAccum, DTypeOut>;
+            void* args[] = {(void*)&q,
+                            (void*)&k,
+                            (void*)&v,
+                            (void*)&custom_mask,
+                            (void*)&o,
+                            (void*)&lse,
+                            (void*)&qo_len,
+                            (void*)&kv_len,
+                            (void*)&group_size_fastdiv,
+                            (void*)&logits_soft_cap,
+                            (void*)&sm_scale,
+                            (void*)&log2_rope_rcp_scale,
+                            (void*)&log2_rope_rcp_theta};
+            dim3 nblks(ceil_div(qo_len * group_size, num_rows_per_cta), 1, num_kv_heads);
+            dim3 nthrs(32, num_warps_x, num_warps_z);
+            FLASHINFER_CUDA_CALL(
+                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            FLASHINFER_CUDA_CALL(
+                cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+          } else {
+            // Use cooperative groups to increase occupancy
+            float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM);
+            void* args[] = {(void*)&q,
+                            (void*)&k,
+                            (void*)&v,
+                            (void*)&custom_mask,
+                            (void*)&tmp,
+                            (void*)&tmp_lse,
+                            (void*)&qo_len,
+                            (void*)&kv_len,
+                            (void*)&group_size_fastdiv,
+                            (void*)&logits_soft_cap,
+                            (void*)&sm_scale,
+                            (void*)&log2_rope_rcp_scale,
+                            (void*)&log2_rope_rcp_theta};
+            dim3 nblks(ceil_div(qo_len * group_size, num_rows_per_cta), num_chunks, num_kv_heads);
+            dim3 nthrs(32, num_warps_x, num_warps_z);
+            FLASHINFER_CUDA_CALL(
+                cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
+            FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
+                                             HEAD_DIM, stream));
+          }
         }
       }
     })
