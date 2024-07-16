@@ -953,15 +953,11 @@ __global__ void SinglePrefillWithKVCacheKernelOpt(
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= math::log2e;
   const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<num_warps_x, num_warps_z>();
-  const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
+  const uint32_t bx = blockIdx.x, kv_head_idx = blockIdx.z;
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
-  constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
   const tensor_info_t<kv_layout, num_frags_y * 16> qkv_info(qo_len, kv_len, num_qo_heads,
                                                             num_kv_heads);
-  float alibi_slopes[num_frags_x][2];
-
   const uint32_t num_chunks = gridDim.y;
-  const uint32_t chunk_size = kv_len;
   const uint32_t chunk_start = 0;
   const uint32_t chunk_end = kv_len;
   auto block = cg::this_thread_block();
@@ -976,7 +972,6 @@ __global__ void SinglePrefillWithKVCacheKernelOpt(
   float o_frag[num_frags_x][num_frags_y][8];
   DTypeQKAccum m[num_frags_x][2];
   float d[num_frags_x][2];
-  float rope_freq[num_frags_y / 2][4];
   init_states<num_frags_x, num_frags_y>(o_frag, m, d);
 
   // cooperative fetch q fragment from gmem to reg

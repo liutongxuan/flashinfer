@@ -836,8 +836,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
       if (opt) {
         auto kernel =
             SingleDecodeWithKVCacheKernelOpt<LOGITS_POST_HOOK, KV_LAYOUT, /*partition_kv=*/false,
-                                          POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
-                                          vec_size, bdx, bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
+                                             POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
+                                             vec_size, bdx, bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
